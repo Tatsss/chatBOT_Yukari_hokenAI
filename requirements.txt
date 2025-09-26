@@ -3,3 +3,4 @@ uvicorn
 python-dotenv
 firebase-admin
 openai>=1.97.0
+tiktoken>=0.7.0

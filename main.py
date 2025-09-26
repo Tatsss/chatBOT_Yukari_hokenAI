@@ -1,12 +1,13 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from openai_client import OpenAIClient
-from firestore_db import FirestoreDB
 import os
 import uvicorn
 import requests
 import logging
 import random
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from openai_client import OpenAIClient, build_messages, generate_chat, estimate_tokens, summarize_text_block
+from firestore_db import FirestoreDB, get_user_profile, get_running_summary, update_running_summary
+from typing import List, Tuple
 
 app = FastAPI()
 openai_client = OpenAIClient()
@@ -75,15 +76,48 @@ async def webhook(body: LineWebhookBody):
             user_message = event.message["text"]
             logger.info(f"👤 From {user_id}: {user_message}")
 
-            last_response_id = db.get_last_response_id(user_id)
-            logger.info(f"⭐️ last_response_id = {last_response_id!r}")
+            # --- ここから差し替えブロック ---------------------------------------
+            # 1) Firestore からプロフィール＆ランニング要約
+            profile_bullets = get_user_profile(user_id)  # ["氏名: ...", "会社: ...", ...]
+            running_summary, last_idx = get_running_summary(user_id)  # thread_id として user_id を使う運用
 
-            ai_response, response_id = openai_client.get_reply(user_message, last_response_id)
-            logger.info(f"🤖 OpenAI replied: response_id={response_id!r}")
+            # 2) 直近Kターン（例：30）を取得して今回の user 発話を追加
+            #    db 側に get_recent_history(user_id, limit) を用意（無ければ実装してください）
+            #    戻りは [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}] 形式を想定
+            try:
+                recent_history = db.get_recent_history(user_id, limit=30)
+            except AttributeError:
+                # フォールバック：過去ログを保持していない場合は空配列で進める
+                recent_history = []
+            recent_turns = [(h["role"], h["content"]) for h in recent_history] + [("user", user_message)]
 
-            db.log_conversation(user_id, user_message, ai_response, response_id)
-            logger.info("💾 log_conversation completed")
+            # 3) コンテキスト構築（ローリング＋予算＋段階的縮約）
+            SYSTEM_PROMPT = "あなたは有能なアシスタントです。丁寧かつ簡潔に日本語で回答します。"
+            messages = build_messages(
+                system_prompt=SYSTEM_PROMPT,
+                profile_bullets=profile_bullets,       # “忘れない事実メモ” を system 直下に差し込み
+                running_summary=running_summary,       # 古い経緯は要約として注入
+                recent_turns=recent_turns,             # 直近Kターン＋今回の入力
+            )
 
+            # 4) 生成（context超過時は generate_chat 内で最小構成にフェイルセーフ）
+            ai_response = generate_chat(messages, max_tokens=1024, temperature=0.3)
+
+            # 5) 会話ログ保存（あなたの既存I/Fに合わせて）
+            db.log_conversation(user_id, user_message, ai_response, response_id=None)
+
+            # 6) 生履歴が膨らんだら、古い半分をサマリに吸収して Firestore 更新
+            raw_tokens = estimate_tokens([{"role": r, "content": c} for r, c in recent_turns])
+            if raw_tokens > 60_000:  # 閾値は運用で調整。gpt-4o-mini なら 60k〜80k 目安
+                # 例：history の前半をひとまとめにして要約→running_summary に追記
+                half = max(1, len(recent_history) // 2)
+                if half > 0:
+                    old_block = "\n\n".join([f"{h['role']}: {h['content']}" for h in recent_history[:half]])
+                    addition = summarize_text_block(old_block)
+                    new_summary = (running_summary + "\n\n" + addition).strip() if running_summary else addition
+                    update_running_summary(user_id, new_summary, last_idx + half)
+
+            # 7) LINE 返信
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
@@ -93,6 +127,8 @@ async def webhook(body: LineWebhookBody):
                 "messages": [{"type": "text", "text": ai_response}]
             }
             requests.post("https://api.line.me/v2/bot/message/reply", headers=headers, json=payload)
+
+            logger.info("✅ webhook text flow completed")
             return {"status": "success"}
 
     return {"status": "unsupported message type"}
